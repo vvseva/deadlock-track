@@ -1,0 +1,194 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+---
+
+```{r}
+library(httr2)
+library(jsonlite)
+library(dplyr)
+library(arrow)
+
+account_id <- Sys.getenv("STEAM_32ACCOUNT_ID")
+```
+
+
+
+```{r}
+library(httr2)
+
+base_url <- paste0("https://api.deadlock-api.com/v1/players/", 
+              account_id, 
+              "/match-history")
+
+response <- request(base_url) |>
+  req_url_query("force_refetch" = "true") |>
+  req_perform()
+
+resp_body_string(response)
+
+response |> 
+  httr2::resp_body_string() |>
+  jsonlite::fromJSON() |> 
+  as_tibble() |> 
+  write_parquet("matches.parquet")
+
+response |> 
+  httr2::resp_body_string() |>
+  jsonlite::fromJSON() |> 
+  as_tibble() |> 
+  filter(game_mode == 4) |> 
+  select(-account_id, -game_mode) -> matches_df
+  
+
+response2 <- request("https://api.deadlock-api.com/v1/assets/heroes") |>
+  req_perform()
+
+response2 |> 
+    httr2::resp_body_string() |>
+  jsonlite::fromJSON() |> 
+  as_tibble() 
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(httr2)
+library(jsonlite)
+library(treemapify)
+library(ggimage)
+library(grid)
+library(magick)
+
+
+heroes_df <- response2 |>
+  resp_body_string() |>
+  fromJSON(flatten = TRUE) |>
+  as_tibble() |>
+  select(
+    hero_id = id, 
+    image_url_regular = images.icon_hero_card,
+    image_url_critical = images.hero_card_critical,
+    image_url_gloat = images.hero_card_gloat,
+    name_image_url = images.name_image,
+    bg_image_url = images.background_image
+  )
+
+# 2. Process your match data (Assuming your tibble is named 'matches_df')
+hero_stats <- matches_df |>
+  group_by(hero_id) |>
+  summarise(
+    picks = n(),
+    wins = mean(match_result) |> round(3) * 100, 
+    .groups = "drop"
+  ) |>
+  left_join(heroes_df, by = "hero_id") |>
+  filter(!is.na(image_url_regular)) |>
+  mutate(
+    # Dynamic portrait assignment based on WR conditions
+    portrait_url = case_when(
+      wins <= 45 ~ image_url_critical,
+      wins >= 55 ~ image_url_gloat,
+      TRUE ~ image_url_regular
+    )
+  ) 
+
+top_hero_bg_url <- hero_stats |> 
+  arrange(desc(picks)) |> 
+  slice(1) |> 
+  pull(bg_image_url)
+
+# Read the image from the URL to build a full-bleed raster
+global_bg_image <- image_read(top_hero_bg_url)
+global_bg_grob <- rasterGrob(global_bg_image, width = unit(1, "npc"), height = unit(1, "npc"), interpolate = TRUE)
+```
+
+```{r}
+# 3. Generate Coordinates & Sizes
+tree_data <- treemapify(hero_stats, area = "picks") |>
+  mutate(
+    x_scale_factor = xmax - xmin,
+    y_scale_factor = ymax - ymin,
+    x_center = (xmin + xmax) / 2,
+    y_center = (ymin + ymax) / 2,
+    
+    name_size = pmin(y_scale_factor * 0.45, x_scale_factor * 0.65),
+    name_y = ymax - (y_scale_factor * 0.20),
+    stats_y = ymin + (y_scale_factor * 0.15)
+  )
+
+# PRE-RENDER TILE BACKGROUNDS: Create a stretched background image for each tile
+tile_bgs <- lapply(seq_len(nrow(tree_data)), function(i) {
+  row <- tree_data[i, ]
+  tryCatch({
+    img <- image_read(row$bg_image_url)
+    grob <- rasterGrob(img, width = unit(1, "npc"), height = unit(1, "npc"), interpolate = TRUE)
+    annotation_custom(grob, xmin = row$xmin, xmax = row$xmax, ymin = row$ymin, ymax = row$ymax)
+  }, error = function(e) NULL)
+})
+tile_bgs <- tile_bgs[!sapply(tile_bgs, is.null)]
+
+# 4. Build the Final Plot
+p <- ggplot(tree_data, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax)) +
+  
+  # Base layer: Full-screen ambient background
+  annotation_custom(global_bg_grob, xmin = 0, xmax = 1, ymin = 0, ymax = 1)
+
+# Inject the tile-specific background images
+for (bg_layer in tile_bgs) {
+  p <- p + bg_layer
+}
+
+# Add standard layers on top
+p <- p +
+  # Colored tile backdrop over the tile backgrounds
+  geom_rect(aes(fill = wins), color = "black", linewidth = 1.0, alpha = 0.80) +
+  
+  # Hero Portrait: Uses dynamic conditional URLs, scaled vertically
+  geom_image(aes(x = x_center, y = y_center, image = portrait_url, size = y_scale_factor * 0.9), by = "height") +
+  
+  scale_fill_gradient2(
+    low = "#3A0202", mid = "#5C4A00", high = "#033010", 
+    midpoint = 50, name = "Win Rate (%)",
+    guide = guide_colorbar(barwidth = 25, barheight = 1, title.position = "top", title.hjust = 0.5)
+  ) +
+  
+  geom_image(aes(x = x_center, y = name_y, image = name_image_url, size = name_size)) +
+  scale_size_identity() + 
+  
+  # Drop shadow layer
+  geom_text(
+    aes(x = x_center + 0.002, y = stats_y - 0.003, label = sprintf("%d | WR: %.1f%%", picks, wins)),
+    color = "black", fontface = "bold", size = 4.5, family = "sans" 
+  ) +
+  
+  # Main text layer
+  geom_text(
+    aes(x = x_center, y = stats_y, label = sprintf("%d | WR: %.1f%%", picks, wins)),
+    color = "#F5F5DC", fontface = "bold", size = 4.5, family = "sans" 
+  ) +
+  
+  theme_void() +
+  theme(
+    plot.background = element_rect(fill = "#050505", color = NA),
+    
+    # ALIGNMENT FIX: Force title and subtitle to align to the edge of the full canvas
+    plot.title.position = "plot", 
+    plot.title = element_text(color = "#D4AF37", face = "bold", size = 24, hjust = 0, margin = margin(t = 15, b = 5)),
+    plot.subtitle = element_text(color = "darkgrey", face = "italic", size = 13, hjust = 0, margin = margin(b = 20)),
+    plot.margin = margin(20, 25, 20, 25),
+    
+    legend.position = "bottom",
+    legend.box = "horizontal",
+    legend.title = element_text(color = "#D4AF37", face = "bold", size = 11, margin = margin(b = 5)),
+    legend.text = element_text(color = "darkgrey", size = 9)
+  ) +
+  labs(
+    title = "Not So Random Random Street Brawl",
+    subtitle = "Based on my 693 games"
+  )
+
+ggsave("random_SB7.png", width = 16, height = 9)
+```
+
