@@ -65,9 +65,10 @@ library(magick)
 heroes_df <- response2 |>
   resp_body_string() |>
   fromJSON(flatten = TRUE) |>
-  as_tibble() |>
+  as_tibble() |> 
   select(
     hero_id = id, 
+    hero_name = name,
     image_url_regular = images.icon_hero_card,
     image_url_critical = images.hero_card_critical,
     image_url_gloat = images.hero_card_gloat,
@@ -190,5 +191,136 @@ p <- p +
   )
 
 ggsave("random_SB7.png", width = 16, height = 9)
+```
+
+
+```{r}
+library(dplyr)
+library(broom)
+
+# Run the classical test with a Monte Carlo simulation
+chi_results <- hero_stats |>
+  pull(picks) |>
+  chisq.test(simulate.p.value = TRUE, B = 10000) |>
+  tidy()
+
+print(chi_results)
+```
+
+```{r}
+library(dplyr)
+library(brms)
+library(tidybayes)
+library(ggplot2)
+
+# Ensure hero_id is treated as a categorical factor
+hero_stats <- hero_stats |>
+  mutate(hero_id = as.factor(hero_id)) 
+
+# Instruct the golem
+fit_heroes <- brm(
+  formula = picks ~ 1 + (1 | hero_id),
+  family = poisson(),
+  data = hero_stats |> 
+    mutate(picks = picks *2),
+  prior = c(
+    prior(normal(3, 1), class = Intercept), # Prior for the global average rate
+    prior(exponential(1), class = sd)       # Regularizing prior for the shrinkage
+  ),
+  chains = 4,
+  cores = 16,
+  iter = 2000,
+  seed = 1234
+)
+
+summary(fit_heroes)
+```
+
+
+```{r}
+hero_stats |> 
+  summarise(int = sum(picks) / mean(picks))
+
+# Extract, summarize, and plot using the native pipe
+fit_heroes |>
+  # Draw from the posterior distribution for each hero
+  spread_draws(b_Intercept, r_hero_id[hero_id, ]) |>
+  # Calculate the expected number of picks (reversing the log link)
+  mutate(expected_picks = exp(b_Intercept + r_hero_id)) |>
+  # Calculate median and 95% credible intervals for each character
+  left_join(heroes_df |> select(hero_id, hero_name)) |> 
+  group_by(hero_name) |>
+  median_qi(expected_picks, .width = 0.95) |>
+  # Plot the landscape of selections
+  ggplot(aes(x = expected_picks, y = reorder(hero_name, expected_picks))) +
+  geom_pointrange(aes(xmin = .lower, xmax = .upper), color = "#2c3e50", size = 0.6) +
+  geom_vline(xintercept = mean(hero_stats$picks)*2, linetype = "dashed", color = "#e74c3c") +
+  labs(
+    title = "Expected Character Pick Frequencies",
+    subtitle = "Points are posterior medians; bars are 95% credible intervals. Dashed line is perfectly equal selection.",
+    x = "Expected Number of Picks",
+    y = "Mystic"
+  ) +
+  theme_minimal()
+```
+
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidybayes)
+library(ggdist)
+
+# Extract and plot the posteriors using ggdist
+fit_heroes |>
+  spread_draws(b_Intercept, r_hero_id[hero_id, ]) |>
+  mutate(expected_picks = exp(b_Intercept + r_hero_id)) |>
+    left_join(heroes_df |> select(hero_id, hero_name)) |> 
+  ggplot(aes(x = expected_picks, y = reorder(hero_name, expected_picks))) +
+  
+  # ggdist best practice: The Half-Eye plot
+  stat_halfeye(
+    # Show both inner (66%) and outer (95%) credible intervals
+    .width = c(0.66, 0.95),
+    
+    # Classic, stark styling
+    fill = "grey85",
+    color = "black",
+    point_interval = median_qi,
+    slab_alpha = 1,
+    linewidth = 0.8,
+    shape = 21,
+    point_fill = "black",
+    point_color = "white",
+    point_size = 2.5
+  ) +
+  
+  # Baseline for perfectly uniform selection
+  geom_vline(
+    xintercept = 700 / 39, 
+    linetype = "dashed", 
+    color = "black", 
+    linewidth = 0.8
+  ) +
+  
+  labs(
+    title = "Expected Character Pick Frequencies",
+    subtitle = "Density slabs with 66% and 95% credible intervals. Dashed line marks uniform selection.",
+    x = "Expected Number of Picks",
+    y = "Hero ID"
+  ) +
+  
+  # Minimalist, high-contrast theme
+  theme_classic(base_family = "mono") +
+  theme(
+    axis.text = element_text(color = "black"),
+    axis.title = element_text(face = "bold", color = "black"),
+    axis.ticks = element_line(color = "black"),
+    axis.line = element_line(color = "black", linewidth = 0.5),
+    plot.title = element_text(face = "bold", size = 14),
+    panel.grid.major.x = element_line(color = "grey90", linetype = "dotted")
+  )
+
+ggsave("posterior.png", width = 16, height = 9)
 ```
 
