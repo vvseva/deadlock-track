@@ -189,8 +189,8 @@ p <- p +
     title = "Not So Random Random Street Brawl",
     subtitle = "Based on my 693 games"
   )
-
-ggsave("random_SB7.png", width = 16, height = 9)
+p
+ggsave("random_SB8.png", width = 16, height = 9)
 ```
 
 
